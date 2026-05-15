@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import mimetypes
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -116,6 +117,8 @@ def get_folder_name(folder_path: str) -> str:
 AUDIO_EXTS = ('.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.opus')
 VIDEO_EXTS = ('.mp4', '.avi', '.mkv', '.webm', '.mov', '.flv', '.wmv', '.m4v')
 MEDIA_EXTS = AUDIO_EXTS + VIDEO_EXTS
+_registered_folder_paths_cache = None
+_registered_folder_paths_lock = threading.Lock()
 
 def scan_media_files(folder_path: str) -> list:
     """Scan folder for audio/video files, naturally sorted."""
@@ -149,36 +152,71 @@ def load_ratings_from_folder(folder_path: str) -> dict:
     return {}
 
 def save_ratings_to_folder(folder_path: str, folder_id: int):
-    """Persist all ratings for a folder to name2json.json in the folder directory."""
+    """Persist ratings to name2json.json while preserving existing metadata."""
     with get_db() as conn:
         rows = conn.execute(
             "SELECT filename, rating, note FROM ratings WHERE folder_id = ?", (folder_id,)
         ).fetchall()
+
+    fp = os.path.join(folder_path, "name2json.json")
+    existing = {}
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            existing = {}
+
     data = {}
+    for filename, info in existing.items():
+        if isinstance(info, dict):
+            data[filename] = dict(info)
+
     for r in rows:
-        entry = {}
+        entry = dict(data.get(r["filename"], {}))
         if r["rating"]:
             entry["rating"] = r["rating"]
+        else:
+            entry.pop("rating", None)
         if r["note"]:
             entry["note"] = r["note"]
+        else:
+            entry.pop("note", None)
         if entry:
             data[r["filename"]] = entry
-    fp = os.path.join(folder_path, "name2json.json")
+        else:
+            data.pop(r["filename"], None)
+
     try:
         with open(fp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"Warning: failed to save name2json.json to {fp}: {e}")
 
+def invalidate_registered_folder_cache():
+    global _registered_folder_paths_cache
+    with _registered_folder_paths_lock:
+        _registered_folder_paths_cache = None
+
+def get_registered_folder_realpaths() -> tuple:
+    global _registered_folder_paths_cache
+    with _registered_folder_paths_lock:
+        if _registered_folder_paths_cache is None:
+            with get_db() as conn:
+                folders = conn.execute("SELECT path FROM folders").fetchall()
+            _registered_folder_paths_cache = tuple(
+                os.path.realpath(folder["path"]) for folder in folders
+            )
+        return _registered_folder_paths_cache
+
 def is_path_under_registered_folder(file_path: str) -> bool:
     """Security check: ensure the file path is under a registered folder."""
     real_path = os.path.realpath(file_path)
-    with get_db() as conn:
-        folders = conn.execute("SELECT path FROM folders").fetchall()
-        for folder in folders:
-            folder_real = os.path.realpath(folder["path"])
-            if real_path.startswith(folder_real + "/") or real_path == folder_real:
-                return True
+    for folder_real in get_registered_folder_realpaths():
+        if real_path.startswith(folder_real + "/") or real_path == folder_real:
+            return True
     return False
 
 # ─────────────────────────── FastAPI App ────────────────────────
@@ -224,6 +262,7 @@ async def create_folder(request: Request):
                     """, (folder_id, fn, r, n))
         except sqlite3.IntegrityError:
             raise HTTPException(400, "Folder already added")
+    invalidate_registered_folder_cache()
     return JSONResponse(row_to_dict(folder))
 
 @app.get("/api/folders")
@@ -237,6 +276,7 @@ async def delete_folder(folder_id: int):
     with get_db() as conn:
         conn.execute("DELETE FROM ratings WHERE folder_id = ?", (folder_id,))
         conn.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+    invalidate_registered_folder_cache()
     return JSONResponse({"ok": True})
 
 @app.put("/api/folders/{folder_id}")
@@ -253,8 +293,25 @@ async def update_folder(folder_id: int, request: Request):
             raise HTTPException(400, "name cannot be empty")
         if not path:
             raise HTTPException(400, "path cannot be empty")
+        path_changed = path != folder["path"]
         conn.execute("UPDATE folders SET name=?, desc=?, path=? WHERE id=?", (name, desc, path, folder_id))
+        if path_changed:
+            # Path 变了:旧路径的 ratings/notes 对新路径无意义,清空后从新路径的 name2json.json 重新导入
+            conn.execute("DELETE FROM ratings WHERE folder_id = ?", (folder_id,))
+            new_ratings = load_ratings_from_folder(path)
+            for fn, info in new_ratings.items():
+                if not isinstance(info, dict):
+                    continue
+                r = info.get("rating", 0)
+                n = info.get("note", "")
+                if r or n:
+                    conn.execute("""
+                        INSERT INTO ratings (folder_id, filename, rating, note)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(folder_id, filename) DO UPDATE SET rating=excluded.rating, note=excluded.note
+                    """, (folder_id, fn, r, n))
         updated = conn.execute("SELECT * FROM folders WHERE id = ?", (folder_id,)).fetchone()
+    invalidate_registered_folder_cache()
     return JSONResponse(row_to_dict(updated))
 
 @app.get("/api/folders/{folder_id}/files")
@@ -773,6 +830,53 @@ button.small {
     padding-bottom: 16px;
     scroll-snap-type: x proximity;
 }
+.compare-panel {
+    width: 380px;
+    min-width: 280px;
+    max-width: 100%;
+    flex-shrink: 0;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    transition: box-shadow 0.15s ease, opacity 0.15s ease;
+}
+.compare-panel.dragging { opacity: 0.72; }
+.compare-panel.drag-over-left { box-shadow: inset 4px 0 0 var(--accent); }
+.compare-panel.drag-over-right { box-shadow: inset -4px 0 0 var(--accent); }
+.panel-drag-top {
+    display: flex;
+    justify-content: center;
+    padding: 8px 16px 2px;
+    background: transparent;
+}
+.panel-drag-handle {
+    width: 30px;
+    height: 10px;
+    padding: 0;
+    border-radius: 999px;
+    border: none;
+    background: transparent;
+    cursor: grab;
+    opacity: 0.36;
+    user-select: none;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.panel-drag-handle::before {
+    content: '';
+    width: 18px;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--text2);
+}
+.panel-drag-handle:hover { opacity: 0.58; }
+.panel-drag-handle:active { cursor: grabbing; }
 .panel-resize-handle {
     position: absolute;
     right: -8px;
@@ -801,19 +905,6 @@ button.small {
 .panel-resize-handle.dragging {
     pointer-events: auto;
 }
-.compare-panel {
-    width: 380px;
-    min-width: 280px;
-    max-width: 100%;
-    flex-shrink: 0;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    position: relative;
-}
 .panel-header {
     background: var(--bg3);
     padding: 12px 16px;
@@ -834,10 +925,11 @@ button.small {
 }
 .panel-name {
     font-weight: 700;
-    font-size: 15px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 13px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    line-height: 1.35;
     color: var(--accent);
 }
 .panel-desc {
@@ -1309,6 +1401,16 @@ body.readonly .note-input {
     transition: all 0.2s;
 }
 .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+.btn-secondary.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(231, 111, 81, 0.08);
+}
+.btn-secondary.toggle-off {
+    color: var(--text2);
+    border-color: var(--border);
+    background: transparent;
+}
 .compare-topbar .active-folders {
     display: flex;
     flex-wrap: wrap;
@@ -1435,8 +1537,9 @@ body.readonly .note-input {
 
 每个文件夹以独立面板展示，支持播放、打分和备注。
 增删文件夹会自动保存当前 Collection。">❓</span>
-                <button class="btn-secondary" onclick="showCompareFolderPicker()">＋ 添加</button>
                 <button class="btn-secondary" onclick="addFolderPrompt()">📂 新建</button>
+                <button class="btn-secondary" onclick="showCompareFolderPicker()">＋ 添加</button>
+                <button class="btn-secondary active" id="compare-scroll-sync-btn" onclick="toggleCompareScrollSync()">联动滚动: 开</button>
             </div>
         </div>
     </div>
@@ -1480,6 +1583,12 @@ body.readonly .note-input {
 let allFolders = [];
 let compareData = null;
 let compareSelectedFolderIds = []; // track selected folder ids in compare view
+let _compareDirty = false; // set when folder mgmt changes folders that may affect compare view
+const comparePanelWidths = {};
+const panelResizeState = { activeHandle: null, startX: 0, startWidth: 0, panels: [] };
+let panelResizeDocumentBound = false;
+let compareScrollSyncEnabled = true;
+const compareScrollSyncState = { syncing: false };
 const VIDEO_EXTS_JS = ['.mp4', '.avi', '.mkv', '.webm', '.mov', '.flv', '.wmv', '.m4v'];
 const AUDIO_EXTS_JS = ['.wav', '.mp3', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.opus'];
 
@@ -1497,13 +1606,24 @@ function isAudioFile(name) {
 // ═══════════════════════════════════════════════════════════════
 function $(id) { return document.getElementById(id); }
 
+// DSW proxy support: extract base path from current URL (e.g. /dsw-400285/ide/proxy/8765)
+const BASE_PATH = (() => {
+    const path = window.location.pathname;
+    const m = path.match(/^(\/dsw-\d+\/ide\/proxy\/\d+)/);
+    return m ? m[1] : '';
+})();
+
 async function api(method, url, body) {
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
     if (body) opts.body = JSON.stringify(body);
-    const res = await fetch(url, opts);
+    // Prepend BASE_PATH for DSW proxy support
+    const fullUrl = url.startsWith('/') ? BASE_PATH + url : url;
+    const res = await fetch(fullUrl, opts);
     if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || JSON.stringify(err));
+        const detail = err.detail || err.message || JSON.stringify(err);
+        console.error('API request failed:', { method, url: fullUrl, status: res.status, err });
+        throw new Error(`[${res.status}] ${method} ${url}: ${detail}`);
     }
     return res.json();
 }
@@ -1530,6 +1650,33 @@ function naturalSort(arr) {
     });
 }
 
+function moveArrayItem(arr, fromIdx, toIdx, insertAfter) {
+    if (!Array.isArray(arr) || fromIdx === toIdx && !insertAfter) return arr ? arr.slice() : [];
+    const next = arr.slice();
+    const [moved] = next.splice(fromIdx, 1);
+    if (moved === undefined) return next;
+    let insertIdx = toIdx;
+    if (fromIdx < toIdx) insertIdx -= 1;
+    if (insertAfter) insertIdx += 1;
+    insertIdx = Math.max(0, Math.min(next.length, insertIdx));
+    next.splice(insertIdx, 0, moved);
+    return next;
+}
+
+function updateCompareScrollSyncButton() {
+    const btn = document.getElementById('compare-scroll-sync-btn');
+    if (!btn) return;
+    btn.classList.toggle('active', compareScrollSyncEnabled);
+    btn.classList.toggle('toggle-off', !compareScrollSyncEnabled);
+    btn.textContent = compareScrollSyncEnabled ? '联动滚动: 开' : '联动滚动: 关';
+    btn.title = compareScrollSyncEnabled ? '关闭后，每列可单独滚动' : '开启后，多列滚动条会联动';
+}
+
+function toggleCompareScrollSync() {
+    compareScrollSyncEnabled = !compareScrollSyncEnabled;
+    updateCompareScrollSyncButton();
+}
+
 function esc(s) {
     const d = document.createElement('div');
     d.textContent = s;
@@ -1537,7 +1684,40 @@ function esc(s) {
 }
 
 function fileUrl(path) {
-    return '/files/' + encodeURIComponent(path).replace(/%2F/g, '/');
+    return BASE_PATH + '/files/' + encodeURIComponent(path).replace(/%2F/g, '/');
+}
+
+function attachMediaSrc(el) {
+    if (!el || el.dataset.mediaReady === '1') return;
+    const src = el.dataset.src;
+    if (!src) return;
+    el.src = src;
+    el.dataset.mediaReady = '1';
+    el.load();
+}
+
+function initLazyMedia(container) {
+    const mediaEls = Array.from((container || document).querySelectorAll('audio[data-src], video[data-src]'));
+    if (!mediaEls.length) return;
+
+    const io = 'IntersectionObserver' in window
+        ? new IntersectionObserver(entries => {
+            entries.forEach(entry => {
+                if (!entry.isIntersecting) return;
+                attachMediaSrc(entry.target);
+                io.unobserve(entry.target);
+            });
+        }, { root: null, rootMargin: '250px 0px' })
+        : null;
+
+    mediaEls.forEach(el => {
+        const warmup = () => attachMediaSrc(el);
+        el.addEventListener('pointerenter', warmup, { once: true });
+        el.addEventListener('touchstart', warmup, { once: true, passive: true });
+        el.addEventListener('focus', warmup, { once: true });
+        if (io) io.observe(el);
+        else warmup();
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1558,6 +1738,11 @@ function switchTab(name) {
         if (!_currentEditCollId) {
             $('compare-coll-name').value = '';
             $('compare-coll-desc').value = '';
+        }
+        // If folder mgmt changed things, refresh compare data
+        if (_compareDirty && compareSelectedFolderIds.length) {
+            _compareDirty = false;
+            loadCompare();
         }
     }
     if (name === 'collections') {
@@ -1802,6 +1987,7 @@ async function saveFolder(id) {
         await api('PUT', `/api/folders/${id}`, { name, path, desc });
         toast('✅ 已保存');
         closeEditOverlay();
+        if (compareSelectedFolderIds.includes(id)) _compareDirty = true;
         loadFolders();
     } catch (e) { toast(e.message, true); }
 }
@@ -1822,7 +2008,7 @@ function editFolderFromCompare(id) {
         <div style="margin-bottom:12px;">
             <label style="display:block;font-size:13px;color:var(--text2);margin-bottom:4px;">路径</label>
             <div style="display:flex;gap:8px;align-items:center;">
-                <input type="text" id="ef-path" value="${esc(f.path)}" readonly style="width:100%;opacity:0.7;cursor:not-allowed;" />
+                <input type="text" id="ef-path" value="${esc(f.path)}" style="width:100%;" />
                 <button class="secondary small" onclick="copyToClipboard(document.getElementById('ef-path').value)" title="复制路径" style="flex-shrink:0;padding:8px 12px;">📋 复制</button>
             </div>
         </div>
@@ -1861,6 +2047,10 @@ async function deleteFolder(id, name) {
     try {
         await api('DELETE', `/api/folders/${id}`);
         toast('已删除');
+        if (compareSelectedFolderIds.includes(id)) {
+            compareSelectedFolderIds = compareSelectedFolderIds.filter(fid => fid !== id);
+            _compareDirty = true;
+        }
         loadFolders();
     } catch (e) { toast(e.message, true); }
 }
@@ -2033,39 +2223,76 @@ function removeCompareFolder(id) {
     }
 }
 
-// Drag to reorder columns
-function initColumnDrag() {
-    const table = document.querySelector('.compare-table');
-    if (!table) return;
-    const thead = table.querySelector('thead');
+// Drag the compare columns by the small handle on top of each panel.
+function initPanelReorder() {
+    const panels = Array.from(document.querySelectorAll('.compare-panel'));
+    const handles = Array.from(document.querySelectorAll('.panel-drag-handle'));
+    if (!panels.length || !handles.length) return;
+
     let dragIdx = null;
 
-    thead.querySelectorAll('th.compare-th').forEach((th, idx) => {
-        th.addEventListener('dragstart', (e) => {
-            dragIdx = idx;
-            th.classList.add('dragging');
+    const clearDragState = () => {
+        panels.forEach(panel => panel.classList.remove('dragging', 'drag-over-left', 'drag-over-right'));
+    };
+
+    handles.forEach(handle => {
+        handle.addEventListener('dragstart', (e) => {
+            dragIdx = Number(handle.dataset.panelIdx);
+            const panel = panels[dragIdx];
+            if (!panel || Number.isNaN(dragIdx)) {
+                dragIdx = null;
+                return;
+            }
+            clearDragState();
+            panel.classList.add('dragging');
             e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', String(dragIdx));
         });
-        th.addEventListener('dragend', () => {
-            th.classList.remove('dragging');
-            thead.querySelectorAll('th').forEach(t => t.classList.remove('drag-over'));
+
+        handle.addEventListener('dragend', () => {
+            clearDragState();
+            dragIdx = null;
         });
-        th.addEventListener('dragover', (e) => {
+    });
+
+    panels.forEach((panel, idx) => {
+        panel.addEventListener('dragover', (e) => {
+            if (dragIdx === null) return;
             e.preventDefault();
             e.dataTransfer.dropEffect = 'move';
-            thead.querySelectorAll('th').forEach(t => t.classList.remove('drag-over'));
-            if (idx !== dragIdx) th.classList.add('drag-over');
+            clearDragState();
+            panels[dragIdx]?.classList.add('dragging');
+            if (idx === dragIdx) return;
+            const rect = panel.getBoundingClientRect();
+            const insertAfter = (e.clientX - rect.left) >= rect.width / 2;
+            panel.classList.add(insertAfter ? 'drag-over-right' : 'drag-over-left');
         });
-        th.addEventListener('drop', (e) => {
+
+        panel.addEventListener('drop', (e) => {
+            if (dragIdx === null) return;
             e.preventDefault();
-            th.classList.remove('drag-over');
-            if (dragIdx !== null && dragIdx !== idx) {
-                const newOrder = [...compareSelectedFolderIds];
-                const [moved] = newOrder.splice(dragIdx, 1);
-                newOrder.splice(idx, 0, moved);
-                compareSelectedFolderIds = newOrder;
-                loadCompare();
+            const fromIdx = dragIdx;
+            if (fromIdx === idx) {
+                clearDragState();
+                dragIdx = null;
+                return;
             }
+            const rect = panel.getBoundingClientRect();
+            const insertAfter = (e.clientX - rect.left) >= rect.width / 2;
+            clearDragState();
+            dragIdx = null;
+
+            const nextIds = moveArrayItem(compareSelectedFolderIds, fromIdx, idx, insertAfter);
+            const changed = nextIds.length === compareSelectedFolderIds.length
+                && nextIds.some((id, orderIdx) => id !== compareSelectedFolderIds[orderIdx]);
+            if (!changed) return;
+
+            compareSelectedFolderIds = nextIds;
+            if (compareData && Array.isArray(compareData.folders)) {
+                compareData.folders = moveArrayItem(compareData.folders, fromIdx, idx, insertAfter);
+            }
+            renderCompare();
+            autoSaveCompareCollection();
         });
     });
 }
@@ -2138,7 +2365,12 @@ function renderCompare() {
     let html = '<div class="compare-panels">';
     folders.forEach((f, idx) => { f._idx = idx;
         const desc = f.folder.desc ? `<span class="panel-desc">${esc(f.folder.desc)}</span>` : '';
-        html += `<div class="compare-panel">`;
+        const panelWidth = comparePanelWidths[f.folder.id];
+        const widthStyle = panelWidth ? ` style="width:${panelWidth}px"` : '';
+        html += `<div class="compare-panel" data-folder-id="${f.folder.id}"${widthStyle}>`;
+        html += `<div class="panel-drag-top">
+            <div class="panel-drag-handle" draggable="true" data-panel-idx="${idx}" title="按住这里拖动列顺序"></div>
+        </div>`;
         html += `<div class="panel-header">
             <div class="panel-title-row">
                 <span class="panel-name">${esc(f.folder.name)}</span>
@@ -2179,9 +2411,9 @@ function renderCompare() {
                 }
             }
             if (isVideo) {
-                html += `<video controls preload="metadata" src="${url}"></video>`;
+                html += `<video controls preload="metadata" data-src="${url}"></video>`;
             } else {
-                html += `<audio controls preload="metadata" src="${url}"></audio>`;
+                html += `<audio controls preload="metadata" data-src="${url}"></audio>`;
             }
             html += `<div class="rating-note-row">`;
             html += `<div class="rating-row">`;
@@ -2204,41 +2436,74 @@ function renderCompare() {
     html += '</div>';
 
     $('compare-content').innerHTML = html;
+    initPanelReorder();
     initPanelResize();
+    initCompareScrollSync();
+    initLazyMedia($('compare-content'));
 }
 
 // 面板拖拽调整宽度
 function initPanelResize() {
     const handles = document.querySelectorAll('.panel-resize-handle');
-    const panels = document.querySelectorAll('.compare-panel');
-    let activeHandle = null;
-    let startX = 0;
-    let startWidth = 0;
+    panelResizeState.panels = Array.from(document.querySelectorAll('.compare-panel'));
 
     handles.forEach(handle => {
         handle.addEventListener('mousedown', (e) => {
             e.preventDefault();
-            activeHandle = handle;
-            handle.classList.add('dragging');
-            startX = e.clientX;
             const panelIdx = parseInt(handle.dataset.panelIdx);
-            startWidth = panels[panelIdx].offsetWidth;
+            const panel = panelResizeState.panels[panelIdx];
+            if (!panel) return;
+            panelResizeState.activeHandle = handle;
+            handle.classList.add('dragging');
+            panelResizeState.startX = e.clientX;
+            panelResizeState.startWidth = panel.offsetWidth;
         });
     });
 
+    if (panelResizeDocumentBound) return;
+    panelResizeDocumentBound = true;
+
     document.addEventListener('mousemove', (e) => {
-        if (!activeHandle) return;
-        const dx = e.clientX - startX;
-        const panelIdx = parseInt(activeHandle.dataset.panelIdx);
-        const newWidth = Math.max(280, startWidth + dx);
-        panels[panelIdx].style.width = newWidth + 'px';
+        if (!panelResizeState.activeHandle) return;
+        const dx = e.clientX - panelResizeState.startX;
+        const panelIdx = parseInt(panelResizeState.activeHandle.dataset.panelIdx);
+        const panel = panelResizeState.panels[panelIdx];
+        if (!panel) return;
+        const newWidth = Math.max(280, panelResizeState.startWidth + dx);
+        panel.style.width = newWidth + 'px';
+        const folderId = Number(panel.dataset.folderId);
+        if (!Number.isNaN(folderId)) comparePanelWidths[folderId] = newWidth;
     });
 
     document.addEventListener('mouseup', () => {
-        if (activeHandle) {
-            activeHandle.classList.remove('dragging');
-            activeHandle = null;
+        if (panelResizeState.activeHandle) {
+            panelResizeState.activeHandle.classList.remove('dragging');
+            panelResizeState.activeHandle = null;
         }
+    });
+}
+
+function initCompareScrollSync() {
+    const filePanels = Array.from(document.querySelectorAll('.panel-files'));
+    updateCompareScrollSyncButton();
+    if (filePanels.length < 2) return;
+
+    filePanels.forEach(panel => {
+        panel.addEventListener('scroll', () => {
+            if (!compareScrollSyncEnabled || compareScrollSyncState.syncing) return;
+            const maxScroll = panel.scrollHeight - panel.clientHeight;
+            const progress = maxScroll > 0 ? panel.scrollTop / maxScroll : 0;
+
+            compareScrollSyncState.syncing = true;
+            filePanels.forEach(other => {
+                if (other === panel) return;
+                const otherMax = other.scrollHeight - other.clientHeight;
+                other.scrollTop = otherMax > 0 ? progress * otherMax : 0;
+            });
+            requestAnimationFrame(() => {
+                compareScrollSyncState.syncing = false;
+            });
+        }, { passive: true });
     });
 }
 
@@ -2474,7 +2739,7 @@ async function saveCollection(id) {
 // Share Collection
 // ═══════════════════════════════════════════════════════════════
 function shareCollection(collId) {
-    const url = `${window.location.origin}/?collection=${collId}&readonly=1`;
+    const url = `${window.location.origin}${BASE_PATH}/?collection=${collId}&readonly=1`;
     copyToClipboard(url);
 }
 
@@ -2545,7 +2810,7 @@ async function handleUrlParams() {
 
 // ═══════════════════════════════════════════════════════════════
 // Init
-// ═════════════��═════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
 // Touch support for collection list item actions
 function initTouchSupport() {
     document.querySelectorAll('.coll-list-item').forEach(item => {
