@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
 import uvicorn
 
 # ─────────────────────────── CLI Args ───────────────────────────
@@ -576,33 +576,54 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#7c5cff">
+<link rel="icon" type="image/png" href="logo.png">
 <title>AV Compare</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root {
-    --bg: #f5f5f5;
+    --bg: #fafafb;
     --bg2: #ffffff;
-    --bg3: #e8e8e8;
-    --text: #1a1a2e;
-    --text2: #666680;
-    --accent: #e94560;
-    --accent2: #7c3aed;
-    --border: #d0d0d8;
-    --success: #4caf50;
-    --warn: #ff9800;
-    --overlay-bg: rgba(0,0,0,0.3);
+    --bg3: #f3f3f7;
+    --text: #0f1020;
+    --text2: #6b6b80;
+    --accent: #7c5cff;
+    --accent2: #a78bfa;
+    --accent-soft: #efeaff;
+    --border: #ececf2;
+    --border-strong: #d8d8e2;
+    --success: #16a34a;
+    --warn: #f59e0b;
+    --danger: #ef4444;
+    --overlay-bg: rgba(15,16,32,0.32);
+    --shadow-sm: 0 1px 2px rgba(15,16,32,.04);
+    --shadow-md: 0 4px 12px rgba(15,16,32,.06);
+    --shadow-lg: 0 12px 32px rgba(15,16,32,.10);
+    --radius-sm: 6px;
+    --radius: 10px;
+    --radius-lg: 14px;
+    --ease: cubic-bezier(.2,.7,.2,1);
 }
 :root.dark {
-    --bg: #1a1a2e;
-    --bg2: #16213e;
-    --bg3: #0f3460;
-    --text: #e0e0e0;
-    --text2: #a0a0b0;
-    --accent: #e94560;
-    --accent2: #533483;
-    --border: #2a2a4a;
-    --success: #4caf50;
-    --warn: #ff9800;
-    --overlay-bg: rgba(0,0,0,0.7);
+    --bg: #0b0d1a;
+    --bg2: #13162a;
+    --bg3: #1c2040;
+    --text: #e8e8f0;
+    --text2: #9a9ab0;
+    --accent: #9d85ff;
+    --accent2: #7c5cff;
+    --accent-soft: #2a2350;
+    --border: #262a45;
+    --border-strong: #353a5c;
+    --success: #22c55e;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --overlay-bg: rgba(0,0,0,0.6);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.3);
+    --shadow-md: 0 4px 12px rgba(0,0,0,.35);
+    --shadow-lg: 0 12px 32px rgba(0,0,0,.45);
 }
 
 .help-icon:hover {
@@ -613,37 +634,94 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 .theme-toggle {
     margin-left: auto;
-    background: none;
+    background: var(--bg2);
     border: 1px solid var(--border);
-    color: var(--text);
-    padding: 6px 12px;
-    border-radius: 20px;
+    color: var(--text2);
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border-radius: 50%;
     cursor: pointer;
-    font-size: 13px;
-    transition: all 0.2s;
-    display: flex;
+    font-size: 15px;
+    transition: all .2s var(--ease);
+    display: inline-flex;
     align-items: center;
-    gap: 4px;
-    white-space: nowrap;
+    justify-content: center;
+    flex-shrink: 0;
 }
-.theme-toggle:hover { border-color: var(--accent); color: var(--accent); opacity: 1; }
+.theme-toggle:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+.theme-toggle .label { display: none; }
 * { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
 body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: 'cv11', 'ss01';
+    letter-spacing: -0.005em;
 }
-a { color: var(--accent); text-decoration: none; }
+::selection { background: var(--accent-soft); color: var(--accent); }
+a { color: var(--accent); text-decoration: none; transition: opacity .15s var(--ease); }
+a:hover { opacity: .8; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--accent2); }
 
 /* ── Header / Tabs ── */
 .header {
-    background: var(--bg2);
+    background: rgba(255,255,255,0.78);
+    backdrop-filter: saturate(180%) blur(12px);
+    -webkit-backdrop-filter: saturate(180%) blur(12px);
     border-bottom: 1px solid var(--border);
-    padding: 0 24px;
+    padding: 0 28px;
     display: flex;
     align-items: center;
-    gap: 0;
+    gap: 4px;
+    height: 60px;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    box-shadow: var(--shadow-sm);
+}
+:root.dark .header { background: rgba(19,22,42,0.78); }
+.brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    margin-right: 28px;
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: -0.01em;
+    user-select: none;
+}
+.brand-logo {
+    width: 26px;
+    height: 26px;
+    display: block;
+    filter: drop-shadow(0 2px 6px rgba(124,92,255,.35));
+}
+.brand-logo-fallback {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    border-radius: 7px;
+    box-shadow: 0 2px 6px rgba(124,92,255,.35);
+    filter: none;
+}
+.brand-name {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
 }
 .header h1 {
     font-size: 18px;
@@ -652,19 +730,22 @@ a { color: var(--accent); text-decoration: none; }
     color: var(--accent);
 }
 .tab-btn {
-    padding: 16px 20px;
+    padding: 8px 16px;
+    margin: 0 2px;
     background: none;
     border: none;
     color: var(--text2);
     font-size: 14px;
+    font-weight: 500;
     cursor: pointer;
-    border-bottom: 2px solid transparent;
-    transition: all 0.2s;
+    border-radius: 999px;
+    transition: all .18s var(--ease);
+    position: relative;
 }
-.tab-btn:hover { color: var(--text); }
+.tab-btn:hover { color: var(--text); background: var(--bg3); }
 .tab-btn.active {
     color: var(--accent);
-    border-bottom-color: var(--accent);
+    background: var(--accent-soft);
 }
 .tab-content { display: none; padding: 24px; }
 .tab-content.active { display: block; }
@@ -673,9 +754,10 @@ a { color: var(--accent); text-decoration: none; }
 .card {
     background: var(--bg2);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 20px;
+    border-radius: var(--radius-lg);
+    padding: 22px 24px;
     margin-bottom: 16px;
+    box-shadow: var(--shadow-sm);
 }
 .input-row {
     display: flex;
@@ -683,51 +765,63 @@ a { color: var(--accent); text-decoration: none; }
     margin-bottom: 16px;
     flex-wrap: wrap;
 }
-input[type="text"], textarea {
-    background: var(--bg);
-    border: 1px solid var(--border);
+input[type="text"], textarea, select {
+    background: var(--bg2);
+    border: 1px solid var(--border-strong);
     color: var(--text);
     padding: 10px 14px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     font-size: 14px;
+    font-family: inherit;
     outline: none;
     flex: 1;
     min-width: 200px;
+    transition: border-color .15s var(--ease), box-shadow .15s var(--ease);
 }
-input[type="text"]:focus, textarea:focus {
+input[type="text"]::placeholder, textarea::placeholder { color: var(--text2); opacity: .7; }
+input[type="text"]:hover, textarea:hover, select:hover { border-color: var(--accent2); }
+input[type="text"]:focus, textarea:focus, select:focus {
     border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
 }
 button {
     background: var(--accent);
     color: #fff;
     border: none;
-    padding: 10px 20px;
-    border-radius: 6px;
+    padding: 9px 18px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-size: 14px;
-    transition: opacity 0.2s;
+    font-family: inherit;
+    font-weight: 500;
+    transition: transform .15s var(--ease), box-shadow .15s var(--ease), background .15s var(--ease);
     white-space: nowrap;
+    box-shadow: 0 1px 2px rgba(124,92,255,.18);
 }
-button:hover { opacity: 0.85; }
+button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(124,92,255,.25); background: var(--accent2); }
+button:active { transform: translateY(0); box-shadow: var(--shadow-sm); }
+button:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-soft), 0 1px 2px rgba(124,92,255,.18); }
 button.secondary {
-    background: var(--bg3);
+    background: var(--bg2);
     color: var(--text);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--shadow-sm);
 }
-:root:not(.dark) button.secondary {
-    background: #f0f0f4;
-    color: #444;
-    border: 1px solid #ccc;
-}
-:root:not(.dark) button.secondary:hover {
-    background: #e0e0e8;
-    border-color: #aaa;
+button.secondary:hover {
+    background: var(--accent-soft);
+    border-color: var(--accent2);
+    color: var(--accent);
 }
 button.danger {
-    background: #c62828;
+    background: var(--danger);
+    box-shadow: 0 1px 2px rgba(239,68,68,.20);
+}
+button.danger:hover {
+    background: #dc2626;
+    box-shadow: 0 4px 12px rgba(239,68,68,.28);
 }
 button.small {
-    padding: 4px 10px;
+    padding: 4px 12px;
     font-size: 12px;
 }
 
@@ -736,10 +830,13 @@ button.small {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    padding: 12px 16px;
+    padding: 14px 16px;
     border-bottom: 1px solid var(--border);
     gap: 16px;
+    transition: background .15s var(--ease);
+    border-radius: var(--radius-sm);
 }
+.folder-item:hover { background: var(--accent-soft); }
 .folder-item:last-child { border-bottom: none; }
 .folder-item .actions { display: flex; gap: 6px; flex-shrink: 0; }
 .folder-info { flex: 1; min-width: 0; }
@@ -752,18 +849,16 @@ button.small {
 }
 .folder-info .desc-badge {
     display: inline-block;
-    margin-top: 4px;
+    margin-top: 6px;
     padding: 2px 10px;
-    background: linear-gradient(135deg, #7c3aed, #a855f7);
-    color: #fff;
-    border-radius: 12px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-radius: 999px;
     font-size: 12px;
-    line-height: 1.4;
+    font-weight: 500;
+    line-height: 1.5;
     max-width: 100%;
     word-break: break-word;
-}
-:root.dark .folder-info .desc-badge {
-    background: #533483;
 }
 .folder-info .path {
     font-size: 11px;
@@ -1217,15 +1312,18 @@ video { width: 100%; min-width: 250px; max-width: 400px; border-radius: 4px; }
     background: var(--success);
     color: #fff;
     padding: 12px 20px;
-    border-radius: 8px;
+    border-radius: var(--radius);
     font-size: 14px;
+    font-weight: 500;
     opacity: 0;
-    transition: opacity 0.3s;
+    transform: translateY(8px);
+    transition: opacity .25s var(--ease), transform .25s var(--ease);
     z-index: 9999;
     pointer-events: none;
+    box-shadow: var(--shadow-lg);
 }
-.toast.show { opacity: 1; }
-.toast.error { background: #c62828; }
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.error { background: var(--danger); }
 
 /* ── Loading ── */
 .loading {
@@ -1390,21 +1488,24 @@ body.readonly .note-input {
     user-select: none;
 }
 .btn-secondary {
-    background: none;
-    border: 1px solid var(--border);
+    background: var(--bg2);
+    border: 1px solid var(--border-strong);
     color: var(--text2);
     padding: 7px 14px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-size: 13px;
+    font-family: inherit;
+    font-weight: 500;
     white-space: nowrap;
-    transition: all 0.2s;
+    transition: all .15s var(--ease);
+    box-shadow: var(--shadow-sm);
 }
-.btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+.btn-secondary:hover { border-color: var(--accent2); color: var(--accent); background: var(--accent-soft); transform: translateY(-1px); }
 .btn-secondary.active {
     border-color: var(--accent);
     color: var(--accent);
-    background: rgba(231, 111, 81, 0.08);
+    background: var(--accent-soft);
 }
 .btn-secondary.toggle-off {
     color: var(--text2);
@@ -1418,10 +1519,12 @@ body.readonly .note-input {
     flex: 1;
 }
 .compare-topbar .active-folder-tag {
-    background: var(--bg3);
+    background: var(--accent-soft);
+    color: var(--accent);
     padding: 4px 10px;
-    border-radius: 12px;
+    border-radius: 999px;
     font-size: 12px;
+    font-weight: 500;
     display: flex;
     align-items: center;
     gap: 4px;
@@ -1445,12 +1548,18 @@ body.readonly .note-input {
 .compare-folder-overlay .overlay-card {
     background: var(--bg2);
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     padding: 24px;
     max-width: 500px;
     width: 90%;
     max-height: 80vh;
     overflow-y: auto;
+    box-shadow: var(--shadow-lg);
+    animation: overlay-pop .22s var(--ease);
+}
+@keyframes overlay-pop {
+    from { opacity: 0; transform: translateY(8px) scale(.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 .compare-folder-overlay .selected-tags {
     display: flex;
@@ -1477,7 +1586,8 @@ body.readonly .note-input {
     padding: 40px 20px;
     color: var(--text2);
 }
-.empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+.empty-state .icon { font-size: 44px; margin-bottom: 12px; opacity: .4; }
+.empty-state p { font-size: 14px; }
 
 /* Pagination / filter */
 .toolbar {
@@ -1503,11 +1613,15 @@ body.readonly .note-input {
 <body>
 
 <div class="header">
-    <h1>📂 AV Compare</h1>
+    <div class="brand">
+        <img src="logo.png" alt="" class="brand-logo"
+             onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'brand-logo brand-logo-fallback',textContent:'AV'}))">
+        <span class="brand-name">AV Compare</span>
+    </div>
     <button class="tab-btn active" onclick="switchTab('collections')">Collection</button>
     <button class="tab-btn" onclick="switchTab('compare')">对比视图</button>
     <button class="tab-btn" onclick="switchTab('folders')">文件夹管理</button>
-    <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">🌙 夜间</button>
+    <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="切换主题">🌙</button>
 </div>
 
 <!-- ═══════════════ Tab 1: Collection ═══════════════ -->
@@ -1769,7 +1883,7 @@ function applyTheme(theme) {
     }
     localStorage.setItem('fc-theme', theme);
     const btn = document.getElementById('theme-toggle');
-    if (btn) btn.innerHTML = theme === 'dark' ? '☀️ 白天' : '🌙 夜间';
+    if (btn) btn.innerHTML = theme === 'dark' ? '☀️' : '🌙';
 }
 function toggleTheme() {
     const current = localStorage.getItem('fc-theme') || 'light';
@@ -2835,6 +2949,34 @@ loadCollections().then(() => {
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_PAGE
+
+_LOGO_PATH = Path(__file__).parent / "logo.png"
+
+_FALLBACK_LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0%" stop-color="#7c5cff"/><stop offset="100%" stop-color="#a78bfa"/>'
+    '</linearGradient></defs>'
+    '<rect x="3" y="3" width="58" height="58" rx="16" fill="url(#g)"/>'
+    '<path d="M22 19 L22 45 L43 45" stroke="#fff" stroke-width="7" fill="none" '
+    'stroke-linecap="round" stroke-linejoin="round"/>'
+    '<circle cx="43" cy="19" r="3.5" fill="#fff"/>'
+    '</svg>'
+)
+
+def _logo_response():
+    if _LOGO_PATH.exists():
+        return FileResponse(_LOGO_PATH, media_type="image/png")
+    from fastapi.responses import Response
+    return Response(content=_FALLBACK_LOGO_SVG, media_type="image/svg+xml")
+
+@app.get("/logo.png")
+def _logo():
+    return _logo_response()
+
+@app.get("/favicon.ico")
+def _favicon():
+    return _logo_response()
 
 # ─────────────────────────── Main ───────────────────────────────
 
